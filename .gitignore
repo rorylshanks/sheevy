@@ -128,3 +128,8 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+
+# Generated binaries
+clickhouse-gsheets-udf
+test.sh
