@@ -1,52 +1,50 @@
-#!/usr/bin/env node
-
-/*
- * googleSheet.js
+/**
+ * Minimal Express.js application that serves *all* data from a specified Google Sheets tab as CSV.
  *
- * This Node.js script reads two arguments from each line of STDIN (tab-separated):
- *    1) spreadsheetUrl  (the full Google Sheets URL)
- *    2) sheetName       (the tab name you want to read)
+ * Install dependencies:
+ *   npm install express googleapis
  *
- * It authenticates using a Google service account by reading credentials
- * from a JSON file on disk, then fetches data from the specified private
- * Google Sheet, and prints rows in TabSeparated format to STDOUT.
+ * Usage:
+ *   1) Provide a service account JSON key either via an environment variable
+ *      GOOGLE_APPLICATION_CREDENTIALS or by specifying a default path in the code.
+ *   2) Run this app: node app.js
+ *   3) Access the data at: http://localhost:3000/<SHEET_ID>/<SHEET_NAME>
  *
- * Setup Requirements:
- *    1) Install dependencies:
- *         npm install googleapis
- *    2) Save your service account JSON key locally, for example: /path/to/google_creds.json
- *    3) Set an environment variable (or hardcode) the path to your JSON file:
- *         export GOOGLE_APPLICATION_CREDENTIALS="/path/to/google_creds.json"
+ * Example:
+ *   http://localhost:3000/6QraRkfoEkZ9agMivOP_1uSD9Tm2GRngwkFfS5T-o-Uw/Sheet1
  *
- * Usage in ClickHouse (after proper UDF config):
- *    SELECT *
- *    FROM googleSheet(
- *      'https://docs.google.com/spreadsheets/d/XXX/edit#gid=123456',
- *      'MyPrivateSheetTab'
- *    );
+ *   Returns all used data in "Sheet1" (the entire used range) from the given Google Sheet
+ *   in CSV format. If the tab name has spaces, you might need URL-encoding or quotes in the route.
  */
 
+const express = require('express');
 const fs = require('fs');
 const { google } = require('googleapis');
-const readline = require('readline');
 
-// Adjust this to wherever your JSON credentials file is stored
-// or read from an environment variable:
-const CREDS_PATH = process.env.GOOGLE_APPLICATION_CREDENTIALS
-  || process.argv[2]
-  || '/creds/google_creds.json';
+// You can set this via an environment variable or hardcode a default path.
+const CREDS_PATH =
+  process.env.GOOGLE_APPLICATION_CREDENTIALS || '/path/to/google_creds.json';
 
 /**
- * Extract the Google spreadsheet ID from its URL.
- * Example: "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit#gid=0"
+ * Very naive CSV escaping. If your data has commas, quotes, line breaks, etc.
+ * in cell values, you may want a more robust library.
  */
-function parseSpreadsheetId(url) {
-  const match = url.match(/\/d\/([a-zA-Z0-9_-]+)/);
-  return match ? match[1] : null;
+function toCsvLine(rowArray) {
+  return rowArray
+    .map((val = '') => {
+      // Escape double quotes by doubling them
+      const safe = String(val).replace(/"/g, '""');
+      // Wrap fields containing commas or quotes in double quotes
+      if (safe.indexOf('"') >= 0 || safe.indexOf(',') >= 0) {
+        return `"${safe}"`;
+      }
+      return safe;
+    })
+    .join(',');
 }
 
 /**
- * Creates an authenticated Google client using service account JSON credentials from file.
+ * Reads service account JSON from file and creates an authenticated Google client.
  */
 async function getAuthClient() {
   let credentials;
@@ -60,55 +58,61 @@ async function getAuthClient() {
 
   return new google.auth.GoogleAuth({
     credentials,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly']
+    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
   });
 }
 
 /**
- * Fetches rows from a given sheet range using the Google Sheets API.
- * The sheet range is: "sheetName!A1:Z1000" (adjust if needed).
+ * Fetches *all* used data from a given sheet. The API will automatically figure out
+ * which cells/rows have data if we pass the sheet name only (A1 notation).
  */
-async function fetchSheetValues(spreadsheetId, sheetName, authClient) {
+async function fetchEntireSheet(spreadsheetId, sheetName, authClient) {
   const sheets = google.sheets({ version: 'v4', auth: authClient });
-  const range = `${sheetName}!A1:Z1000`;
+  // By specifying the sheet's name only (e.g. "Sheet1"), 
+  // the Sheets API returns all used data in that sheet.
+  const range = sheetName;
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId,
-    range
+    range,
   });
+
+  // returns a 2D array (rows of columns)
   return res.data.values || [];
 }
 
 (async function main() {
   const authClient = await getAuthClient();
-  const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const app = express();
 
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    const [spreadsheetUrl, sheetName] = line.split('\t').map(s => s.trim());
-    const spreadsheetId = parseSpreadsheetId(spreadsheetUrl);
+  /**
+   * GET /:spreadsheetId/:sheetName
+   * Example: /6QraRkfoEkZ9agMivOP_1uSD9Tm2GRngwkFfS5T-o-Uw/Sheet1
+   */
+  app.get('/:spreadsheetId/:sheetName', async (req, res) => {
+    const { spreadsheetId, sheetName } = req.params;
 
-    if (!spreadsheetId) {
-      console.error(`Could not parse spreadsheet ID from URL: ${spreadsheetUrl}`);
-      process.exit(1);
+    if (!spreadsheetId || !sheetName) {
+      return res.status(400).send('Missing spreadsheetId or sheetName in URL path.');
     }
 
-    let rows;
     try {
-      rows = await fetchSheetValues(spreadsheetId, sheetName, authClient);
-    } catch (err) {
-      console.error(`Error fetching data: ${err.message}`);
-      process.exit(1);
-    }
+      const rows = await fetchEntireSheet(spreadsheetId, sheetName, authClient);
+      // Convert each row to CSV
+      const csvLines = rows.map(toCsvLine);
+      const csvContent = csvLines.join('\n');
 
-    // Output each row in TabSeparated format.
-    for (const rowData of rows) {
-      const MAX_COLS = 100;
-      const slice = rowData.slice(0, MAX_COLS);
-      while (slice.length < MAX_COLS) {
-        slice.push('');
-      }
-      console.log(slice.join('\t'));
+      // Send CSV
+      res.type('text/csv');
+      return res.send(csvContent);
+    } catch (err) {
+      console.error('Error fetching sheet data:', err);
+      return res.status(500).send(`Error fetching sheet data: ${err.message}`);
     }
-  }
+  });
+
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => {
+    console.log(`Express server listening on port ${port}`);
+  });
 })();

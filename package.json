@@ -10,9 +10,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "express": "^4.21.2",
     "googleapis": "^144.0.0"
-  },
-  "devDependencies": {
-    "@yao-pkg/pkg": "^6.3.0"
   }
 }
