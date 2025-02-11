@@ -6,8 +6,10 @@
  * A simple Express.js app that:
  *  - Reads Google Sheets data using a service account JSON file
  *  - Serves the entire sheet/tab as CSV on the route: /:spreadsheetId/:sheetName
- *  - Ensures all rows have the same number of columns, based on the header row
- *  - Logs basic events (startup, requests, and data fetches) via console
+ *  - Allows specifying (via ?headerRow=N) which row in the sheet is treated as the header row
+ *    for determining how many columns each row should have.
+ *  - Ensures all rows have the same number of columns (based on that header row).
+ *  - Logs basic events to the console.
  *
  * Prerequisites:
  *   1) npm install express googleapis
@@ -18,7 +20,8 @@
  *
  * Usage:
  *   node sheevy.js
- *   Then access: http://localhost:3000/<spreadsheetId>/<sheetName>
+ *   Then access: http://localhost:3000/<spreadsheetId>/<sheetName>?headerRow=2
+ *   - If ?headerRow is omitted, defaults to 1 (the first row).
  */
 
 const express = require('express');
@@ -104,15 +107,19 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
 
   /**
    * Main route: GET /:spreadsheetId/:sheetName
-   * Returns a CSV representation of the sheet.
+   * Optional query param: ?headerRow=N (1-based index)
+   *    - Tells which row to treat as the header row for determining the column count.
    */
   app.get('/:spreadsheetId/:sheetName', async (req, res) => {
     const { spreadsheetId, sheetName } = req.params;
-
     if (!spreadsheetId || !sheetName) {
       console.error('[sheevy] Missing spreadsheetId or sheetName in the URL path.');
       return res.status(400).send('Missing spreadsheetId or sheetName.');
     }
+
+    // Default header row is 1 if not specified
+    const headerRowParam = req.query.headerRow;
+    const headerRow = headerRowParam ? parseInt(headerRowParam, 10) : 1;
 
     let rows = [];
     try {
@@ -129,8 +136,19 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
       return res.send('');
     }
 
-    // Determine the number of columns based on the first (header) row
-    const colCount = rows[0].length;
+    // Validate the headerRow is within the actual data range
+    if (headerRow < 1 || headerRow > rows.length) {
+      console.error(`[sheevy] headerRow=${headerRow} is out of range. Total rows: ${rows.length}`);
+      return res
+        .status(400)
+        .send(`headerRow=${headerRow} is out of range (1..${rows.length}).`);
+    }
+
+    // Arrays are zero-indexed, user input is 1-based
+    const headerIndex = headerRow - 1;
+
+    // Determine the number of columns based on the chosen header row
+    const colCount = rows[headerIndex].length;
 
     // Normalize each row to have exactly colCount columns
     const normalizedRows = rows.map((row) => {
@@ -146,7 +164,7 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
     const csvContent = csvLines.join('\n');
 
     console.log(
-      `[sheevy] Sending CSV with ${normalizedRows.length} rows and ${colCount} columns.`
+      `[sheevy] Sending CSV with ${normalizedRows.length} rows, based on row #${headerRow} as header (colCount=${colCount}).`
     );
     res.type('text/csv').send(csvContent);
   });
