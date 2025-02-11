@@ -4,11 +4,12 @@
  * sheevy.js
  *
  * A simple Express.js app that:
- *  - Reads Google Sheets data using a service account JSON file
+ *  - Reads Google Sheets data via a service account JSON file
  *  - Serves the entire sheet/tab as CSV on the route: /:spreadsheetId/:sheetName
  *  - Allows specifying (via ?headerRow=N) which row in the sheet is treated as the header row
  *    for determining how many columns each row should have.
- *  - Ensures all rows have the same number of columns (based on that header row).
+ *  - Ignores all rows before the specified header row.
+ *  - Safely handles newlines inside cells (by enclosing them in quotes).
  *  - Logs basic events to the console.
  *
  * Prerequisites:
@@ -16,12 +17,14 @@
  *   2) Have a valid service account JSON key path:
  *      - Set via an environment variable GOOGLE_APPLICATION_CREDENTIALS
  *        or
- *      - Hardcode a default path in this file.
+ *      - Hardcode a fallback in this file.
  *
  * Usage:
  *   node sheevy.js
  *   Then access: http://localhost:3000/<spreadsheetId>/<sheetName>?headerRow=2
  *   - If ?headerRow is omitted, defaults to 1 (the first row).
+ *   - The specified header row is used to determine column count, and
+ *     all rows before it are ignored in the output.
  */
 
 const express = require('express');
@@ -29,27 +32,32 @@ const fs = require('fs');
 const { google } = require('googleapis');
 
 /**
- * Set this to either an environment variable or a fallback path to your service
- * account credentials JSON file.
+ * Path to your service account credentials JSON file.
  */
 const CREDS_PATH =
   process.env.GOOGLE_APPLICATION_CREDENTIALS || '/path/to/google_creds.json';
 
 /**
- * Converts a row (array of cell values) into a CSV line with minimal escaping.
- * If your data can have quotes, commas, newlines, etc., you may want a more robust CSV library.
+ * Converts a row (array of cell values) into a CSV line, handling commas, quotes,
+ * and newlines by enclosing them in quotes as needed.
  */
 function toCsvLine(rowArray) {
   return rowArray
     .map((val) => {
-      // Ensure a string
-      const cell = String(val || '');
+      // Convert null/undefined to empty, otherwise to string
+      const cell = val == null ? '' : String(val);
+
+      // Normalize any \r\n or \r to \n, so we handle multiline consistently
+      const normalized = cell.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
       // Escape double quotes by doubling them
-      const escaped = cell.replace(/"/g, '""');
-      // Wrap in quotes if needed (commas/quotes)
-      if (escaped.includes('"') || escaped.includes(',')) {
+      const escaped = normalized.replace(/"/g, '""');
+
+      // If there's a newline, quote, or comma, wrap in quotes
+      if (escaped.search(/["\n,]/) !== -1) {
         return `"${escaped}"`;
       }
+
       return escaped;
     })
     .join(',');
@@ -76,7 +84,7 @@ async function getAuthClient() {
 
 /**
  * Fetches all used data from the given sheet/tab.
- * Using just the sheet name for range returns all used rows and columns.
+ * Using just the sheet name for range returns all used rows/columns automatically.
  */
 async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
   const sheets = google.sheets({ version: 'v4', auth });
@@ -106,9 +114,10 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
   });
 
   /**
-   * Main route: GET /:spreadsheetId/:sheetName
+   * GET /:spreadsheetId/:sheetName
    * Optional query param: ?headerRow=N (1-based index)
-   *    - Tells which row to treat as the header row for determining the column count.
+   *   - Tells which row to treat as the header row for determining the column count.
+   *   - All rows before this row are ignored entirely.
    */
   app.get('/:spreadsheetId/:sheetName', async (req, res) => {
     const { spreadsheetId, sheetName } = req.params;
@@ -136,7 +145,7 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
       return res.send('');
     }
 
-    // Validate the headerRow is within the actual data range
+    // Validate the headerRow is within range
     if (headerRow < 1 || headerRow > rows.length) {
       console.error(`[sheevy] headerRow=${headerRow} is out of range. Total rows: ${rows.length}`);
       return res
@@ -144,11 +153,21 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
         .send(`headerRow=${headerRow} is out of range (1..${rows.length}).`);
     }
 
-    // Arrays are zero-indexed, user input is 1-based
+    // Convert user-specified header row (1-based) to zero-based index
     const headerIndex = headerRow - 1;
 
-    // Determine the number of columns based on the chosen header row
-    const colCount = rows[headerIndex].length;
+    // Slice off all rows before the header row
+    rows = rows.slice(headerIndex);
+
+    // If, after slicing, we have no rows, just return empty
+    if (rows.length === 0) {
+      console.log('[sheevy] No data remains after ignoring rows before headerRow.');
+      res.type('text/csv');
+      return res.send('');
+    }
+
+    // Determine the column count based on the new first row (the chosen header row)
+    const colCount = rows[0].length;
 
     // Normalize each row to have exactly colCount columns
     const normalizedRows = rows.map((row) => {
@@ -159,7 +178,7 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
       return padded;
     });
 
-    // Convert each row to CSV
+    // Convert each row to CSV lines
     const csvLines = normalizedRows.map(toCsvLine);
     const csvContent = csvLines.join('\n');
 
