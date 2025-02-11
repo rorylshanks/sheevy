@@ -1,50 +1,59 @@
+#!/usr/bin/env node
+
 /**
- * Minimal Express.js application that serves *all* data from a specified Google Sheets tab as CSV.
+ * sheevy.js
  *
- * Install dependencies:
- *   npm install express googleapis
+ * A simple Express.js app that:
+ *  - Reads Google Sheets data using a service account JSON file
+ *  - Serves the entire sheet/tab as CSV on the route: /:spreadsheetId/:sheetName
+ *  - Ensures all rows have the same number of columns, based on the header row
+ *  - Logs basic events (startup, requests, and data fetches) via console
+ *
+ * Prerequisites:
+ *   1) npm install express googleapis
+ *   2) Have a valid service account JSON key path:
+ *      - Set via an environment variable GOOGLE_APPLICATION_CREDENTIALS
+ *        or
+ *      - Hardcode a default path in this file.
  *
  * Usage:
- *   1) Provide a service account JSON key either via an environment variable
- *      GOOGLE_APPLICATION_CREDENTIALS or by specifying a default path in the code.
- *   2) Run this app: node app.js
- *   3) Access the data at: http://localhost:3000/<SHEET_ID>/<SHEET_NAME>
- *
- * Example:
- *   http://localhost:3000/6QraRkfoEkZ9agMivOP_1uSD9Tm2GRngwkFfS5T-o-Uw/Sheet1
- *
- *   Returns all used data in "Sheet1" (the entire used range) from the given Google Sheet
- *   in CSV format. If the tab name has spaces, you might need URL-encoding or quotes in the route.
+ *   node sheevy.js
+ *   Then access: http://localhost:3000/<spreadsheetId>/<sheetName>
  */
 
 const express = require('express');
 const fs = require('fs');
 const { google } = require('googleapis');
 
-// You can set this via an environment variable or hardcode a default path.
+/**
+ * Set this to either an environment variable or a fallback path to your service
+ * account credentials JSON file.
+ */
 const CREDS_PATH =
   process.env.GOOGLE_APPLICATION_CREDENTIALS || '/path/to/google_creds.json';
 
 /**
- * Very naive CSV escaping. If your data has commas, quotes, line breaks, etc.
- * in cell values, you may want a more robust library.
+ * Converts a row (array of cell values) into a CSV line with minimal escaping.
+ * If your data can have quotes, commas, newlines, etc., you may want a more robust CSV library.
  */
 function toCsvLine(rowArray) {
   return rowArray
-    .map((val = '') => {
+    .map((val) => {
+      // Ensure a string
+      const cell = String(val || '');
       // Escape double quotes by doubling them
-      const safe = String(val).replace(/"/g, '""');
-      // Wrap fields containing commas or quotes in double quotes
-      if (safe.indexOf('"') >= 0 || safe.indexOf(',') >= 0) {
-        return `"${safe}"`;
+      const escaped = cell.replace(/"/g, '""');
+      // Wrap in quotes if needed (commas/quotes)
+      if (escaped.includes('"') || escaped.includes(',')) {
+        return `"${escaped}"`;
       }
-      return safe;
+      return escaped;
     })
     .join(',');
 }
 
 /**
- * Reads service account JSON from file and creates an authenticated Google client.
+ * Creates an authenticated Google client using service account JSON credentials from file.
  */
 async function getAuthClient() {
   let credentials;
@@ -52,7 +61,7 @@ async function getAuthClient() {
     const raw = fs.readFileSync(CREDS_PATH, 'utf8');
     credentials = JSON.parse(raw);
   } catch (err) {
-    console.error(`Failed to read or parse credentials file at ${CREDS_PATH}: ${err.message}`);
+    console.error(`[sheevy] Error reading credentials from ${CREDS_PATH}:`, err.message);
     process.exit(1);
   }
 
@@ -63,56 +72,88 @@ async function getAuthClient() {
 }
 
 /**
- * Fetches *all* used data from a given sheet. The API will automatically figure out
- * which cells/rows have data if we pass the sheet name only (A1 notation).
+ * Fetches all used data from the given sheet/tab.
+ * Using just the sheet name for range returns all used rows and columns.
  */
-async function fetchEntireSheet(spreadsheetId, sheetName, authClient) {
-  const sheets = google.sheets({ version: 'v4', auth: authClient });
-  // By specifying the sheet's name only (e.g. "Sheet1"), 
-  // the Sheets API returns all used data in that sheet.
-  const range = sheetName;
+async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
+  const sheets = google.sheets({ version: 'v4', auth });
+  const range = sheetName; // e.g. "Sheet1"
 
+  console.log(
+    `[sheevy] Fetching data for sheet "${sheetName}" in spreadsheet "${spreadsheetId}"...`
+  );
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range,
   });
 
-  // returns a 2D array (rows of columns)
-  return res.data.values || [];
+  const rows = res.data.values || [];
+  console.log(`[sheevy] Fetched ${rows.length} rows for sheet "${sheetName}".`);
+  return rows;
 }
 
 (async function main() {
   const authClient = await getAuthClient();
   const app = express();
 
+  // Simple logger middleware
+  app.use((req, res, next) => {
+    console.log(`[sheevy] Incoming request: ${req.method} ${req.url}`);
+    next();
+  });
+
   /**
-   * GET /:spreadsheetId/:sheetName
-   * Example: /6QraRkfoEkZ9agMivOP_1uSD9Tm2GRngwkFfS5T-o-Uw/Sheet1
+   * Main route: GET /:spreadsheetId/:sheetName
+   * Returns a CSV representation of the sheet.
    */
   app.get('/:spreadsheetId/:sheetName', async (req, res) => {
     const { spreadsheetId, sheetName } = req.params;
 
     if (!spreadsheetId || !sheetName) {
-      return res.status(400).send('Missing spreadsheetId or sheetName in URL path.');
+      console.error('[sheevy] Missing spreadsheetId or sheetName in the URL path.');
+      return res.status(400).send('Missing spreadsheetId or sheetName.');
     }
 
+    let rows = [];
     try {
-      const rows = await fetchEntireSheet(spreadsheetId, sheetName, authClient);
-      // Convert each row to CSV
-      const csvLines = rows.map(toCsvLine);
-      const csvContent = csvLines.join('\n');
-
-      // Send CSV
-      res.type('text/csv');
-      return res.send(csvContent);
-    } catch (err) {
-      console.error('Error fetching sheet data:', err);
-      return res.status(500).send(`Error fetching sheet data: ${err.message}`);
+      rows = await fetchEntireSheet(spreadsheetId, sheetName, authClient);
+    } catch (error) {
+      console.error(`[sheevy] Error fetching sheet data: ${error.message}`);
+      return res.status(500).send(`Error fetching sheet data: ${error.message}`);
     }
+
+    // If no rows, return empty CSV
+    if (rows.length === 0) {
+      console.log('[sheevy] No data found for this sheet.');
+      res.type('text/csv');
+      return res.send('');
+    }
+
+    // Determine the number of columns based on the first (header) row
+    const colCount = rows[0].length;
+
+    // Normalize each row to have exactly colCount columns
+    const normalizedRows = rows.map((row) => {
+      const padded = row.slice(0, colCount);
+      while (padded.length < colCount) {
+        padded.push('');
+      }
+      return padded;
+    });
+
+    // Convert each row to CSV
+    const csvLines = normalizedRows.map(toCsvLine);
+    const csvContent = csvLines.join('\n');
+
+    console.log(
+      `[sheevy] Sending CSV with ${normalizedRows.length} rows and ${colCount} columns.`
+    );
+    res.type('text/csv').send(csvContent);
   });
 
+  // Start server
   const port = process.env.PORT || 3000;
   app.listen(port, () => {
-    console.log(`Express server listening on port ${port}`);
+    console.log(`[sheevy] Server is listening on port ${port}`);
   });
 })();
