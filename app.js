@@ -6,15 +6,15 @@
  * A simple Express.js app that:
  *  - Reads Google Sheets data via a service account JSON file
  *  - Serves the entire sheet/tab as CSV on the route: /:spreadsheetId/:sheetName
- *  - Allows specifying (via ?headerRow=N) which row in the sheet is treated as the header row
- *    for determining how many columns each row should have.
- *  - Ignores all rows before the specified header row.
- *  - Safely handles newlines inside cells (by enclosing them in quotes).
+ *  - Allows specifying (via ?headerRow=N) which row in the sheet is the header row,
+ *    ignoring all rows before it and using it to determine column count.
+ *  - Safely handles newlines and commas inside cells by enclosing them in quotes.
  *  - Logs basic events to the console.
+ *  - Uses the "cache" NPM package for in-memory caching (expires after 30 seconds).
  *
  * Prerequisites:
- *   1) npm install express googleapis
- *   2) Have a valid service account JSON key path:
+ *   1) npm install express googleapis cache
+ *   2) Have a valid service account JSON key file:
  *      - Set via an environment variable GOOGLE_APPLICATION_CREDENTIALS
  *        or
  *      - Hardcode a fallback in this file.
@@ -22,20 +22,25 @@
  * Usage:
  *   node sheevy.js
  *   Then access: http://localhost:3000/<spreadsheetId>/<sheetName>?headerRow=2
- *   - If ?headerRow is omitted, defaults to 1 (the first row).
- *   - The specified header row is used to determine column count, and
- *     all rows before it are ignored in the output.
  */
 
 const express = require('express');
 const fs = require('fs');
 const { google } = require('googleapis');
+const Cache = require('cache'); // npm install cache
 
 /**
  * Path to your service account credentials JSON file.
  */
 const CREDS_PATH =
   process.env.GOOGLE_APPLICATION_CREDENTIALS || '/path/to/google_creds.json';
+
+/**
+ * In-memory cache using the "cache" package.
+ * We'll store rows from Google Sheets for 30 seconds.
+ */
+const memoryCache = new Cache();
+const CACHE_TTL_MS = 30_000; // 30 seconds
 
 /**
  * Converts a row (array of cell values) into a CSV line, handling commas, quotes,
@@ -57,7 +62,6 @@ function toCsvLine(rowArray) {
       if (escaped.search(/["\n,]/) !== -1) {
         return `"${escaped}"`;
       }
-
       return escaped;
     })
     .join(',');
@@ -83,8 +87,8 @@ async function getAuthClient() {
 }
 
 /**
- * Fetches all used data from the given sheet/tab.
- * Using just the sheet name for range returns all used rows/columns automatically.
+ * Fetches all used data from the given sheet/tab. Using just the sheet name for range
+ * returns all used rows and columns automatically.
  */
 async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
   const sheets = google.sheets({ version: 'v4', auth });
@@ -93,10 +97,7 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
   console.log(
     `[sheevy] Fetching data for sheet "${sheetName}" in spreadsheet "${spreadsheetId}"...`
   );
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range,
-  });
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId, range });
 
   const rows = res.data.values || [];
   console.log(`[sheevy] Fetched ${rows.length} rows for sheet "${sheetName}".`);
@@ -129,7 +130,22 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
     // Default header row is 1 if not specified
     const headerRowParam = req.query.headerRow;
     const headerRow = headerRowParam ? parseInt(headerRowParam, 10) : 1;
+    if (Number.isNaN(headerRow) || headerRow < 1) {
+      console.error(`[sheevy] Invalid headerRow param: ${req.query.headerRow}`);
+      return res.status(400).send(`Invalid headerRow param: ${req.query.headerRow}`);
+    }
 
+    // Cache key includes spreadsheetId, sheetName, and headerRow
+    const cacheKey = `${spreadsheetId}::${sheetName}::${headerRow}`;
+    const cachedResult = memoryCache.get(cacheKey);
+
+    if (cachedResult) {
+      console.log(`[sheevy] Cache hit for key: ${cacheKey}`);
+      return sendCsv(cachedResult, headerRow, res);
+    }
+
+    // Otherwise, fetch from Sheets
+    console.log(`[sheevy] Cache miss for key: ${cacheKey}`);
     let rows = [];
     try {
       rows = await fetchEntireSheet(spreadsheetId, sheetName, authClient);
@@ -138,39 +154,51 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
       return res.status(500).send(`Error fetching sheet data: ${error.message}`);
     }
 
-    // If no rows, return empty CSV
+    // Store in cache for 30 seconds
+    memoryCache.put(
+      cacheKey,
+      rows,
+      CACHE_TTL_MS,
+      (key, value) => console.log(`[sheevy] Cache expired for key: ${key}`)
+    );
+
+    // Send CSV
+    return sendCsv(rows, headerRow, res);
+  });
+
+  /**
+   * Helper function: normalizes rows based on the specified headerRow (ignoring rows above it),
+   * then sends them as CSV in the response.
+   */
+  function sendCsv(rows, headerRow, res) {
     if (rows.length === 0) {
       console.log('[sheevy] No data found for this sheet.');
       res.type('text/csv');
       return res.send('');
     }
 
-    // Validate the headerRow is within range
-    if (headerRow < 1 || headerRow > rows.length) {
+    if (headerRow > rows.length) {
       console.error(`[sheevy] headerRow=${headerRow} is out of range. Total rows: ${rows.length}`);
       return res
         .status(400)
         .send(`headerRow=${headerRow} is out of range (1..${rows.length}).`);
     }
 
-    // Convert user-specified header row (1-based) to zero-based index
-    const headerIndex = headerRow - 1;
-
     // Slice off all rows before the header row
-    rows = rows.slice(headerIndex);
+    const headerIndex = headerRow - 1;
+    const slicedRows = rows.slice(headerIndex);
 
-    // If, after slicing, we have no rows, just return empty
-    if (rows.length === 0) {
+    if (slicedRows.length === 0) {
       console.log('[sheevy] No data remains after ignoring rows before headerRow.');
       res.type('text/csv');
       return res.send('');
     }
 
-    // Determine the column count based on the new first row (the chosen header row)
-    const colCount = rows[0].length;
+    // Determine the column count based on the new first row
+    const colCount = slicedRows[0].length;
 
     // Normalize each row to have exactly colCount columns
-    const normalizedRows = rows.map((row) => {
+    const normalizedRows = slicedRows.map((row) => {
       const padded = row.slice(0, colCount);
       while (padded.length < colCount) {
         padded.push('');
@@ -183,10 +211,10 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
     const csvContent = csvLines.join('\n');
 
     console.log(
-      `[sheevy] Sending CSV with ${normalizedRows.length} rows, based on row #${headerRow} as header (colCount=${colCount}).`
+      `[sheevy] Sending CSV with ${normalizedRows.length} rows (row #${headerRow} as header, colCount=${colCount}).`
     );
     res.type('text/csv').send(csvContent);
-  });
+  }
 
   // Start server
   const port = process.env.PORT || 3000;
