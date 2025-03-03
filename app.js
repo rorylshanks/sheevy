@@ -104,6 +104,80 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
   return rows;
 }
 
+/**
+ * Helper function: Removes columns whose header (first row) is empty ("NULL" header).
+ * Returns a new 2D array with only columns that have a non-empty header.
+ */
+function removeNullHeaders(rows) {
+  if (rows.length === 0) return rows;
+  const header = rows[0];
+  // Determine indices of columns to keep (where header is not empty)
+  const indicesToKeep = header
+    .map((cell, index) => (cell !== '' ? index : null))
+    .filter((idx) => idx !== null);
+
+  // Return a new array with only the columns to keep for each row
+  return rows.map((row) =>
+    indicesToKeep.map((idx) => (row[idx] !== undefined ? row[idx] : ''))
+  );
+}
+
+/**
+ * Helper function: normalizes rows based on the specified headerRow (ignoring rows above it),
+ * optionally removes columns with NULL (empty) header names (if allowNullableHeaders is false),
+ * then sends them as CSV in the response.
+ */
+function sendCsv(rows, headerRow, res, allowNullableHeaders) {
+  if (rows.length === 0) {
+    console.log('[sheevy] No data found for this sheet.');
+    res.type('text/csv');
+    return res.send('');
+  }
+
+  if (headerRow > rows.length) {
+    console.error(`[sheevy] headerRow=${headerRow} is out of range. Total rows: ${rows.length}`);
+    return res
+      .status(400)
+      .send(`headerRow=${headerRow} is out of range (1..${rows.length}).`);
+  }
+
+  // Slice off all rows before the header row
+  const headerIndex = headerRow - 1;
+  const slicedRows = rows.slice(headerIndex);
+
+  if (slicedRows.length === 0) {
+    console.log('[sheevy] No data remains after ignoring rows before headerRow.');
+    res.type('text/csv');
+    return res.send('');
+  }
+
+  // Determine the column count based on the new first row
+  const colCount = slicedRows[0].length;
+
+  // Normalize each row to have exactly colCount columns
+  let normalizedRows = slicedRows.map((row) => {
+    const padded = row.slice(0, colCount);
+    while (padded.length < colCount) {
+      padded.push('');
+    }
+    return padded;
+  });
+
+  // Remove any columns with a NULL (empty) header unless allowNullableHeaders is set
+  if (!allowNullableHeaders) {
+    normalizedRows = removeNullHeaders(normalizedRows);
+  }
+
+  // Convert each row to CSV lines
+  const csvLines = normalizedRows.map(toCsvLine);
+  const csvContent = csvLines.join('\n');
+
+  console.log(
+    `[sheevy] Sending CSV with ${normalizedRows.length} rows (row #${headerRow} as header, colCount=${normalizedRows[0].length}).`
+  );
+  res.type('text/csv').send(csvContent);
+}
+
 (async function main() {
   const authClient = await getAuthClient();
   const app = express();
@@ -116,9 +190,10 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
 
   /**
    * GET /:spreadsheetId/:sheetName
-   * Optional query param: ?headerRow=N (1-based index)
-   *   - Tells which row to treat as the header row for determining the column count.
-   *   - All rows before this row are ignored entirely.
+   * Optional query params:
+   *   - headerRow=N (1-based index): Tells which row to treat as the header row for determining the column count.
+   *     All rows before this row are ignored entirely.
+   *   - allowNulableHeaders=1: If set to "1", columns with NULL header names will NOT be removed.
    */
   app.get('/:spreadsheetId/:sheetName', async (req, res) => {
     const { spreadsheetId, sheetName } = req.params;
@@ -135,13 +210,16 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
       return res.status(400).send(`Invalid headerRow param: ${req.query.headerRow}`);
     }
 
+    // Determine whether to allow nullable headers (i.e. do NOT remove them)
+    const allowNullableHeaders = req.query.allowNulableHeaders === '1';
+
     // Cache key includes spreadsheetId, sheetName, and headerRow
     const cacheKey = `${spreadsheetId}::${sheetName}::${headerRow}`;
     const cachedResult = memoryCache.get(cacheKey);
 
     if (cachedResult) {
       console.log(`[sheevy] Cache hit for key: ${cacheKey}`);
-      return sendCsv(cachedResult, headerRow, res);
+      return sendCsv(cachedResult, headerRow, res, allowNullableHeaders);
     }
 
     // Otherwise, fetch from Sheets
@@ -163,58 +241,8 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
     );
 
     // Send CSV
-    return sendCsv(rows, headerRow, res);
+    return sendCsv(rows, headerRow, res, allowNullableHeaders);
   });
-
-  /**
-   * Helper function: normalizes rows based on the specified headerRow (ignoring rows above it),
-   * then sends them as CSV in the response.
-   */
-  function sendCsv(rows, headerRow, res) {
-    if (rows.length === 0) {
-      console.log('[sheevy] No data found for this sheet.');
-      res.type('text/csv');
-      return res.send('');
-    }
-
-    if (headerRow > rows.length) {
-      console.error(`[sheevy] headerRow=${headerRow} is out of range. Total rows: ${rows.length}`);
-      return res
-        .status(400)
-        .send(`headerRow=${headerRow} is out of range (1..${rows.length}).`);
-    }
-
-    // Slice off all rows before the header row
-    const headerIndex = headerRow - 1;
-    const slicedRows = rows.slice(headerIndex);
-
-    if (slicedRows.length === 0) {
-      console.log('[sheevy] No data remains after ignoring rows before headerRow.');
-      res.type('text/csv');
-      return res.send('');
-    }
-
-    // Determine the column count based on the new first row
-    const colCount = slicedRows[0].length;
-
-    // Normalize each row to have exactly colCount columns
-    const normalizedRows = slicedRows.map((row) => {
-      const padded = row.slice(0, colCount);
-      while (padded.length < colCount) {
-        padded.push('');
-      }
-      return padded;
-    });
-
-    // Convert each row to CSV lines
-    const csvLines = normalizedRows.map(toCsvLine);
-    const csvContent = csvLines.join('\n');
-
-    console.log(
-      `[sheevy] Sending CSV with ${normalizedRows.length} rows (row #${headerRow} as header, colCount=${colCount}).`
-    );
-    res.type('text/csv').send(csvContent);
-  }
 
   // Start server
   const port = process.env.PORT || 3000;
