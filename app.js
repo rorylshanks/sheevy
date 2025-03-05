@@ -105,21 +105,43 @@ async function fetchEntireSheet(spreadsheetId, sheetName, auth) {
 }
 
 /**
- * Helper function: Removes columns whose header (first row) is empty ("NULL" header).
+ * Helper function: Removes columns whose header (first row) is empty ("NULL" header) or '#N/A'.
  * Returns a new 2D array with only columns that have a non-empty header.
  */
-function removeNullHeaders(rows) {
-  if (rows.length === 0) return rows;
-  const header = rows[0];
-  // Determine indices of columns to keep (where header is not empty)
-  const indicesToKeep = header
-    .map((cell, index) => (cell !== '' ? index : null))
-    .filter((idx) => idx !== null);
+function removeInvalidHeaders(rows) {
+  if (rows.length === 0) {
+    return rows;
+  }
 
-  // Return a new array with only the columns to keep for each row
-  return rows.map((row) =>
-    indicesToKeep.map((idx) => (row[idx] !== undefined ? row[idx] : ''))
-  );
+  // Get the header row.
+  var header = rows[0];
+  var indicesToKeep = [];
+
+  // Identify indices of valid headers.
+  for (var i = 0; i < header.length; i++) {
+    var cell = header[i];
+    if (cell !== '' && cell !== '#N/A' && cell !== '#REF!') {
+      indicesToKeep.push(i);
+    }
+  }
+
+  // Create a new array including only the valid columns for each row.
+  var filteredRows = [];
+  for (var j = 0; j < rows.length; j++) {
+    var row = rows[j];
+    var newRow = [];
+    for (var k = 0; k < indicesToKeep.length; k++) {
+      var index = indicesToKeep[k];
+      if (index < row.length) {
+        newRow.push(row[index]);
+      } else {
+        newRow.push('');
+      }
+    }
+    filteredRows.push(newRow);
+  }
+
+  return filteredRows;
 }
 
 /**
@@ -165,7 +187,7 @@ function sendCsv(rows, headerRow, res, allowNullableHeaders) {
 
   // Remove any columns with a NULL (empty) header unless allowNullableHeaders is set
   if (!allowNullableHeaders) {
-    normalizedRows = removeNullHeaders(normalizedRows);
+    normalizedRows = removeInvalidHeaders(normalizedRows);
   }
 
   // Convert each row to CSV lines
