@@ -36,6 +36,8 @@ const express = require('express');
 const fs = require('fs');
 const { google } = require('googleapis');
 const Cache = require('cache'); // npm install cache
+const zlib = require('zlib');
+const { PassThrough } = require('stream');
 
 /**
  * Path to your service account credentials JSON file.
@@ -87,7 +89,7 @@ async function getAuthClient() {
 
   return new google.auth.GoogleAuth({
     credentials,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly', 'https://www.googleapis.com/auth/drive.readonly'],
   });
 }
 
@@ -268,6 +270,87 @@ function sendRawCsv(rows, res) {
   app.use((req, res, next) => {
     console.log(`[sheevy] Incoming request: ${req.method} ${req.url}`);
     next();
+  });
+
+
+  app.get('/drive/:fileId', async (req, res) => {
+    const { fileId } = req.params;
+    const cacheDir = '/tmp';
+    const cacheFilePath = `${cacheDir}/drive_${fileId}.csv.gz`;
+  
+    // Check if we already have a cached (gzipped) version on disk.
+    if (fs.existsSync(cacheFilePath)) {
+      console.log(`[sheevy] Serving drive file ${fileId} from disk cache.`);
+      res.setHeader('Content-Type', 'text/csv');
+      // Stream from disk, decompress on the fly, then pipe to the client.
+      const readStream = fs.createReadStream(cacheFilePath);
+      const gunzip = zlib.createGunzip();
+      return readStream.pipe(gunzip).pipe(res);
+    }
+  
+    // File is not cached: download from Google Drive.
+    console.log(`[sheevy] Downloading drive file ${fileId} from Google Drive.`);
+    // Create a Drive API client; note that authClient (from getAuthClient) must have
+    // the drive.readonly scope in addition to spreadsheets.readonly.
+    const drive = google.drive({ version: 'v3', auth: authClient });
+    try {
+      // Retrieve file metadata (name and mimeType)
+      const metaRes = await drive.files.get({
+        fileId,
+        fields: 'name, mimeType',
+      });
+      const { name } = metaRes.data;
+      // Verify that the file appears to be a CSV file based on its name.
+      if (!name.toLowerCase().endsWith('.csv')) {
+        return res.status(400).send('File is not a CSV file based on its name.');
+      }
+  
+      // Request the file content as a stream.
+      const fileRes = await drive.files.get(
+        { fileId, alt: 'media' },
+        { responseType: 'stream' }
+      );
+      const driveStream = fileRes.data;
+  
+      // Create two PassThrough streams to "tee" the drive stream:
+      // one for piping to the client (raw CSV),
+      // and one for compressing and writing to disk.
+      const clientStream = new PassThrough();
+      const diskStream = new PassThrough();
+  
+      // Manually tee the data from driveStream to both pass-through streams.
+      driveStream.on('data', (chunk) => {
+        clientStream.write(chunk);
+        diskStream.write(chunk);
+      });
+      driveStream.on('end', () => {
+        clientStream.end();
+        diskStream.end();
+      });
+      driveStream.on('error', (err) => {
+        console.error('Error downloading file from Drive:', err);
+        clientStream.destroy(err);
+        diskStream.destroy(err);
+        return res.status(500).end('Error downloading file from Drive.');
+      });
+  
+      // Ensure the cache directory exists.
+      if (!fs.existsSync(cacheDir)) {
+        fs.mkdirSync(cacheDir, { recursive: true });
+      }
+      // Pipe the disk branch through gzip and then to a write stream
+      // so that the file is saved compressed.
+      const gzip = zlib.createGzip();
+      const fileWriteStream = fs.createWriteStream(cacheFilePath);
+      diskStream.pipe(gzip).pipe(fileWriteStream);
+  
+      // Send the raw CSV stream to the client.
+      res.setHeader('Content-Type', 'text/csv');
+      clientStream.pipe(res);
+    } catch (err) {
+      console.error('Error processing drive file request:', err.message);
+      return res.status(500).send('Error processing drive file request: ' + err.message);
+    }
   });
 
   /**
