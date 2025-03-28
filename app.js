@@ -273,52 +273,128 @@ function sendRawCsv(rows, res) {
   });
 
 
+  // Helper function: Waits until the cache file exists, or if the lock is stale, removes it.
+  function waitForCacheFile(cacheFilePath, lockFilePath, timeout = 30000, interval = 500) {
+    return new Promise((resolve, reject) => {
+      const startTime = Date.now();
+      function check() {
+        // If the cache file is present, resolve.
+        if (!fs.existsSync(lockFilePath)) {
+          return resolve();
+        }
+        // If the lock file exists, check its age.
+        if (fs.existsSync(lockFilePath)) {
+          const stats = fs.statSync(lockFilePath);
+          const age = Date.now() - stats.ctimeMs;
+          if (age > timeout) {
+            console.log(`[sheevy] Lock file is stale (age: ${age}ms), removing it.`);
+            try {
+              fs.unlinkSync(lockFilePath);
+            } catch (err) {
+              console.error(`[sheevy] Error removing stale lock file: ${err.message}`);
+            }
+            return resolve();
+          }
+        }
+        // If waiting too long, reject.
+        if (Date.now() - startTime > timeout) {
+          return reject(new Error('Timeout waiting for cache file'));
+        }
+        setTimeout(check, interval);
+      }
+      check();
+    });
+  }
+
+  /**
+   * GET /drive/:fileId
+   *
+   * This endpoint downloads a file from Google Drive given its fileId.
+   * It checks that the file’s name ends with ".csv" (case-insensitive),
+   * then streams the file from Drive while simultaneously:
+   *   - Piping the raw CSV stream directly to the client.
+   *   - Piping a copy through gzip to a file on disk for indefinite caching.
+   *
+   * If a download is already in progress (indicated by a lock file),
+   * subsequent requests wait (up to 30 seconds) for the cache to be ready.
+   * If the lock file is older than 30 seconds, it is removed and the file is re-downloaded.
+   */
   app.get('/drive/:fileId', async (req, res) => {
     const { fileId } = req.params;
-    const cacheDir = '/tmp';
+    const cacheDir = './cache';
     const cacheFilePath = `${cacheDir}/drive_${fileId}.csv.gz`;
-  
-    // Check if we already have a cached (gzipped) version on disk.
+    const lockFilePath = `${cacheDir}/drive_${fileId}.lock`;
+
+    // Ensure the cache directory exists.
+    if (!fs.existsSync(cacheDir)) {
+      fs.mkdirSync(cacheDir, { recursive: true });
+    }
+
+    // If a lock file exists, wait for the download to finish.
+    if (fs.existsSync(lockFilePath)) {
+      try {
+        console.log(`[sheevy] Lock file exists for ${fileId}. Waiting for download to complete...`);
+        await waitForCacheFile(cacheFilePath, lockFilePath, 30000, 500);
+        if (!fs.existsSync(lockFilePath)) {
+          console.log(`[sheevy] Download completed while waiting. Serving file ${fileId} from disk cache.`);
+          res.setHeader('Content-Type', 'text/csv');
+          const readStream = fs.createReadStream(cacheFilePath);
+          const gunzip = zlib.createGunzip();
+          return readStream.pipe(gunzip).pipe(res);
+        }
+        console.log(`[sheevy] Cache file not available after waiting. Proceeding with download for ${fileId}.`);
+      } catch (err) {
+        console.error(`[sheevy] Error waiting for cache file: ${err.message}`);
+        // If waiting failed, fall through to attempt a new download.
+      }
+    }
+
+    // If the cache file exists, stream it immediately.
     if (fs.existsSync(cacheFilePath)) {
       console.log(`[sheevy] Serving drive file ${fileId} from disk cache.`);
       res.setHeader('Content-Type', 'text/csv');
-      // Stream from disk, decompress on the fly, then pipe to the client.
       const readStream = fs.createReadStream(cacheFilePath);
       const gunzip = zlib.createGunzip();
       return readStream.pipe(gunzip).pipe(res);
     }
-  
-    // File is not cached: download from Google Drive.
-    console.log(`[sheevy] Downloading drive file ${fileId} from Google Drive.`);
-    // Create a Drive API client; note that authClient (from getAuthClient) must have
-    // the drive.readonly scope in addition to spreadsheets.readonly.
-    const drive = google.drive({ version: 'v3', auth: authClient });
+
+    // Create a lock file to signal that a download is in progress.
     try {
-      // Retrieve file metadata (name and mimeType)
+      fs.writeFileSync(lockFilePath, 'lock');
+    } catch (err) {
+      console.error(`[sheevy] Unable to create lock file for ${fileId}: ${err.message}`);
+      return res.status(500).send('Unable to create lock file.');
+    }
+
+    // Proceed to download from Google Drive.
+    console.log(`[sheevy] Downloading drive file ${fileId} from Google Drive.`);
+    try {
+      // Create a Drive API client; authClient must have drive.readonly scope.
+      const drive = google.drive({ version: 'v3', auth: authClient });
+      // Retrieve file metadata (name, mimeType).
       const metaRes = await drive.files.get({
         fileId,
         fields: 'name, mimeType',
       });
       const { name } = metaRes.data;
-      // Verify that the file appears to be a CSV file based on its name.
+      // Verify the file name ends with ".csv" (case-insensitive).
       if (!name.toLowerCase().endsWith('.csv')) {
+        fs.unlinkSync(lockFilePath);
         return res.status(400).send('File is not a CSV file based on its name.');
       }
-  
+
       // Request the file content as a stream.
       const fileRes = await drive.files.get(
         { fileId, alt: 'media' },
         { responseType: 'stream' }
       );
       const driveStream = fileRes.data;
-  
-      // Create two PassThrough streams to "tee" the drive stream:
-      // one for piping to the client (raw CSV),
-      // and one for compressing and writing to disk.
+
+      // Create two PassThrough streams to tee the drive stream:
+      // one for sending raw CSV to the client, the other for writing to disk.
       const clientStream = new PassThrough();
       const diskStream = new PassThrough();
-  
-      // Manually tee the data from driveStream to both pass-through streams.
+
       driveStream.on('data', (chunk) => {
         clientStream.write(chunk);
         diskStream.write(chunk);
@@ -331,24 +407,38 @@ function sendRawCsv(rows, res) {
         console.error('Error downloading file from Drive:', err);
         clientStream.destroy(err);
         diskStream.destroy(err);
+        if (fs.existsSync(lockFilePath)) {
+          fs.unlink(lockFilePath, (err) => {
+            if (err) console.error(`[sheevy] Error removing lock file: ${err.message}`);
+          });
+        }
         return res.status(500).end('Error downloading file from Drive.');
       });
-  
-      // Ensure the cache directory exists.
-      if (!fs.existsSync(cacheDir)) {
-        fs.mkdirSync(cacheDir, { recursive: true });
-      }
-      // Pipe the disk branch through gzip and then to a write stream
-      // so that the file is saved compressed.
+
+      // Pipe the disk branch through gzip and write to disk.
       const gzip = zlib.createGzip();
       const fileWriteStream = fs.createWriteStream(cacheFilePath);
       diskStream.pipe(gzip).pipe(fileWriteStream);
-  
-      // Send the raw CSV stream to the client.
+
+      // When writing finishes, remove the lock file.
+      fileWriteStream.on('finish', () => {
+        console.log(`[sheevy] Finished writing file ${fileId} to cache.`);
+        if (fs.existsSync(lockFilePath)) {
+          fs.unlink(lockFilePath, (err) => {
+            if (err) console.error(`[sheevy] Error removing lock file for ${fileId}: ${err.message}`);
+            else console.log(`[sheevy] Lock file for ${fileId} removed.`);
+          });
+        }
+      });
+
+      // Stream the raw CSV directly to the client.
       res.setHeader('Content-Type', 'text/csv');
       clientStream.pipe(res);
     } catch (err) {
       console.error('Error processing drive file request:', err.message);
+      if (fs.existsSync(lockFilePath)) {
+        fs.unlinkSync(lockFilePath);
+      }
       return res.status(500).send('Error processing drive file request: ' + err.message);
     }
   });
