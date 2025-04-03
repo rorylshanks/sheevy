@@ -7,9 +7,9 @@
     A simple yet powerful API service to access CSV files and Google Sheets stored in Google Drive as CSV data via HTTP requests, with built-in support for integration with ClickHouse.
     <br />
     <br />
-    <a href="https://github.com/your-repo/sheevy/issues">Report Bug</a>
+    <a href="https://github.com/rorylshanks/sheevy/issues">Report Bug</a>
     ·
-    <a href="https://github.com/your-repo/sheevy/issues">Request Feature</a>
+    <a href="https://github.com/rorylshanks/sheevy/issues">Request Feature</a>
   </p>
 </div>
 
